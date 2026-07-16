@@ -135,6 +135,9 @@ Flash chip : Winbond W25Q128.V
 Capacity   : 16 MB
 Interface  : SPI 3.3V
 RAM        : NANYA NT5CC128M8GR (DDR3 128MB, visible on PCB)
+SoC        : Canon custom ASIC FSJ0AS018CA (QK2-4000)
+             Manufactured in Taiwan, 2204 (Q2 2022)
+             Same chip used in: Canon PIXMA TS3450, Canon PIXMA E3640
 ```
 
 ### SPI wiring (Raspberry Pi 5 GPIO)
