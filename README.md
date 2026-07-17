@@ -2,16 +2,16 @@
 
 **Date:** July 2026  
 **Author:** TheFrenchGuy  
-**Status:** Personal research on owned hardware  
-**Firmware version:** V00.15.RC1.JAPAN-CANON
+**Status:** ✅ Complete — manifest and OTA firmware fully decrypted  
+**Firmware version:** V00.15.RC1.JAPAN-CANON / 1.040
 
 ---
 
 ## TL;DR
 
-First documented firmware analysis of the Canon PIXMA TS3451 (2020+ series). Using a Raspberry Pi 5 GPIO as an SPI programmer, I dumped the full 16MB flash (Winbond W25Q128). Found 3 decompressed zlib firmware blobs containing the full network stack, web interface, and crypto library (MatrixSSL/BSAFE). The firmware update manifest is AES-GCM encrypted — the key is derived at runtime via a software Asset Store and never exists in plaintext on the flash. Looking for help identifying the key derivation scheme.
+First documented firmware analysis of the Canon PIXMA TS3451 (2020+ series). Using a Raspberry Pi 5 GPIO as an SPI programmer, I dumped the full 16MB flash (Winbond W25Q128). Found 20 decompressed zlib firmware blobs across 3 partitions. The firmware update manifest was AES-128-CBC encrypted — key and IV recovered by community member **Wintermute** via blob disassembly. Full OTA firmware (`A18B7V1040AN.bin`) subsequently downloaded and decrypted.
 
-**What's new:** All public Canon PIXMA firmware research (Synacktiv, Contextis, leecher1337) targets 2010-2015 models. The TS3400 series has never been documented publicly, as far as I know.
+**What's new:** All public Canon PIXMA firmware research (Synacktiv, Contextis, leecher1337) targets 2010-2015 models. The TS3400 series had never been documented publicly.
 
 ---
 
@@ -43,7 +43,7 @@ This gave full HTTP interception of all printer traffic.
 ### Canon infrastructure
 
 ```
-gdlp01.c-wss.com              HTTP/80    Firmware manifest (AES-GCM encrypted)
+gdlp01.c-wss.com              HTTP/80    Firmware manifest (AES-128-CBC encrypted)
 dtv-p.c-ij.com                HTTP/80    Version check + CA trust store
 skyprtr-an13.srv.ygles.com    HTTPS/443  Canon cloud (DigiCert cert, TLS pinned)
 ```
@@ -71,7 +71,6 @@ class FakeCanonVersion:
             flow.response.content = bytes([0xFF, 0xFF])
             flow.response.headers["Content-Length"] = "2"
 
-        # Save everything from Canon servers
         if any(d in flow.request.pretty_host for d in ["gdlp01.c-wss.com", "c-ij.com"]):
             fname = flow.request.path.split("/")[-1] or "index"
             with open(f"/tmp/canon_{fname}", "wb") as f:
@@ -80,28 +79,38 @@ class FakeCanonVersion:
 addons = [FakeCanonVersion()]
 ```
 
-### Firmware manifest
+### Firmware manifest — SOLVED ✅
 
 Full URL of the manifest:
 ```
 http://gdlp01.c-wss.com/rmds/ij/ijd/ijdupdate/a18b7.bin
 ```
 
-The file is **304 bytes = exactly 19 AES blocks of 16 bytes**.
+The manifest is **AES-128-CBC encrypted** (not AES-GCM as initially suspected).
 
-```
-Entropy : 7.31 bits/byte
-Blocks  : 19 × 16 bytes (no AES-ECB repetitions)
-→ AES-CBC or AES-GCM
+**Decryption (credit: Wintermute):**
+```bash
+openssl enc -d -aes-128-cbc \
+  -K e3b7ab92ea3d18ce1be4b39a72d11204 \
+  -iv 44230b7adada0b1a569bfacdb5400245 \
+  -in a18b7.bin \
+  -out manifest_decrypted.xml
 ```
 
-Manifest hex dump:
+**Decrypted manifest:**
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<update_info>
+  <Dummy1>Dummy1</Dummy1>
+  <Dummy2>Dummy2</Dummy2>
+  <Dummy3>Dummy3</Dummy3>
+  <version>1.040</version>
+  <url>http://pdisp01.c-wss.com/gdl/WWUFORedirectTarget.do?id=MDQwMDAwNzg2MzAx</url>
+  <size>7230976</size>
+</update_info>
 ```
-246ab3ce 885379c2 09f86e9b 7cf7fd28  $j...Sy...n.|..(
-c7fe298d a395a6a7 ffa43175 37150959  ..).......1u7..Y
-...
-defd68bd 8cf777d9 98b67939 e589a898  (last 16 bytes = likely GCM tag)
-```
+
+**Key/IV generator functions** located at `0xb88b4` and `0xb8702` in the firmware blobs (streams at offsets `0x002E6004`, `0x00375C9C`, `0x00422288`, `0x00499D70`).
 
 ### CA trust store (sdata.bin)
 
@@ -121,8 +130,6 @@ defd68bd 8cf777d9 98b67939 e589a898  (last 16 bytes = likely GCM tag)
 | GlobalSign Root CA / R3 / R4 | 2028–2038 | Valid |
 | VeriSign Class 3 G2/G5 | 2028–2036 | Valid |
 | GTS Root R1/R2/R3/R4 | 2036 | Valid |
-
-`skyprtr-an13.srv.ygles.com` is signed by DigiCert (valid until 2027) → TLS interception blocked.
 
 ---
 
@@ -158,25 +165,16 @@ SOIC-8 Pin 8 (VCC)   → 3.3V   (physical pin 1)
 ### Dump
 
 ```bash
-# Enable SPI on Pi
 sudo raspi-config nonint do_spi 0
-
-# Install flashrom
 sudo apt install flashrom -y
-
-# Detect chip
 sudo flashrom -p linux_spi:dev=/dev/spidev0.0,spispeed=4000
 # Found Winbond flash chip "W25Q128.V" (16384 kB, SPI)
 
-# Dump twice and verify integrity
 sudo flashrom -p linux_spi:dev=/dev/spidev0.0,spispeed=4000 -r dump1.bin
 sudo flashrom -p linux_spi:dev=/dev/spidev0.0,spispeed=4000 -r dump2.bin
 md5sum dump1.bin dump2.bin
-# 14c99631cf1d3b04f00d0d53f8f79f91  dump1.bin
-# 14c99631cf1d3b04f00d0d53f8f79f91  dump2.bin
+# 14c99631cf1d3b04f00d0d53f8f79f91  (both identical)
 ```
-
-Identical MD5 → clean dump.
 
 **Firmware hashes:**
 ```
@@ -191,128 +189,102 @@ Version: V00.15.RC1.JAPAN-CANON
 
 ### Partition map (16 MB)
 
-Entropy analysis (64KB chunks):
-
 | Offset | Size | Entropy | Content |
 |--------|------|---------|---------|
 | 0x000000 | 256 KB | ~2.4 | **ARM32 bootloader (plaintext)** |
 | 0x040000 | ~1.7 MB | 0.00 | Empty flash (0xFF) |
 | 0x220000 | 128 KB | ~4.6 | Config / certificates |
-| 0x2E0000 | ~1.8 MB | ~8.0 | **DryOS firmware (zlib + AES-GCM)** |
-| 0x560000 | ~4.5 MB | ~8.0 | Firmware backup image |
+| 0x2E0000 | ~1.8 MB | ~8.0 | **DryOS firmware (zlib + AES-CBC)** |
+| 0x560000 | ~4.5 MB | ~8.0 | Firmware backup partition |
 | 0xBA0000 | ~2.3 MB | ~8.0 | Third firmware partition |
-| 0xF00000 | ~1 MB | mixed | **NVRAM / persistent config** |
+| 0xF00000 | ~1 MB | mixed | **NVRAM / persistent config (plaintext)** |
 
-### Bootloader (0x000000, plaintext ARM32)
+### Decompressed firmware blobs — 20 total
 
-The bootloader is unencrypted. It contains Canon's RSA public keys and implements a full secure boot chain:
+Full zlib scan across all partitions found **20 unique decompressible streams**:
 
+**Main partition (0x2E0000) — 4 blobs:**
 ```
-Strings found:
-  V00.15.RC1.JAPAN-CANON    ← exact firmware version
-  cSt.>;w7y8)Ug%T[          ← 16-byte AES key candidate (unconfirmed)
-
-RSA functions:
-  CLS_ALLOCATE_RSA_PUBLIC_KEY
-  FLH_AssetLoadRSAPublicKey
-  CLS_HashVerifyRecoverPkcs1
-
-Secure boot chain:
-  SoC ROM (immutable)
-    → verifies bootloader RSA signature
-      → bootloader verifies firmware signature
-        → firmware executes
+0x002E6004  → 1024 KB  ARM Thumb code
+0x00375C9C  → 1024 KB  Network/crypto stack (MatrixSSL/BSAFE)
+0x00422288  → 1024 KB  Web interface / HTTP server
+0x00499D70  →  ~100 KB mDNS/Bonjour + cert manager
 ```
 
-Modifying the bootloader without Canon's private key = brick.
-
-### Decompressed firmware blobs
-
-The high-entropy zones contain **nested zlib blobs**, identified by magic byte scan (`78 9c`, `78 da`):
-
-```bash
-# Zone 0x2E0000 contains 3 valid zlib streams:
-+0x06004  → zlib → 1024 KB  [blob0: ARM Thumb code]
-+0x95c9c  → zlib → 1024 KB  [blob1: network/crypto stack]
-+0x142288 → zlib → 1024 KB  [blob2: web interface / HTTP]
+**Backup partition (0x560000) — 9 blobs:**
+```
+Print-job-status XML, MIME decoder (scan-to-email),
+scan subsystem code, UI glyph/bitmap atlas,
+local-UI cert-management templates,
+second MatrixSSL blob at 0x8b1044 (matrixsslApi.c)
 ```
 
-**blob1 — network stack:**
-
+**Third partition (0xBA0000) — 6 blobs:**
 ```
-Full firmware update URL:
-  http://gdlp01.c-wss.com/rmds/ij/ijd/ijdupdate/a18b7.bin
-
-User-Agent: IP Client/1.0.0.0
-
-Crypto library: MatrixSSL / RSA Security BSAFE
-Key functions found:
-  flpsul_create_gcm_giv_key_and_state  ← AES-GCM with generated IV
-  CLS_EncryptAuthInitDeterministic
-  CLS_AssetAllocate
-  CLS_AssetLoadValue
-  tagLen == 16
-  IV_prefixlen == 4 || IV_prefixlen == 6
-  keylen == 16 || keylen == 24 || keylen == 32
+ARM code blobs, DryOS subsystem debug strings,
+PNG image assets, LCD touchscreen UI
+(message tables + JS state machine + CSS)
 ```
 
-**blob2 — web interface & OS:**
+### Key findings in blobs
 
 ```
-Full embedded HTTP server
-Admin UI at /rui/ (JavaScript)
-Firmware update endpoints: firm_update.cgi, get_job_status.cgi
-Full mDNS/DNS-SD stack
-eSCL/AirScan support (driverless scanning over network)
-NS_FLAG_NETUPDATE=enable
-R_CR_decrypt_init / R_CR_decrypt_update / R_CR_decrypt_final
-  → "HMAC MD5 err", "HMAC SHA1 err", "AES Keywrap err"
-AES S-box found at blob2+0x8a3db
+firmware update URL    : http://gdlp01.c-wss.com/rmds/ij/ijd/ijdupdate/a18b7.bin
+User-Agent             : IP Client/1.0.0.0
+Crypto library         : MatrixSSL / RSA Security BSAFE
+SNMP                   : net-snmp 5.7.2 (v1 only, community: public)
+Web interface accounts : canon_admin / canon_user (no default password)
+eSCL/AirScan           : fully implemented (driverless scanning)
 ```
 
-### NVRAM (0xF00000)
+### NVRAM (0xF00000, plaintext)
 
-Persistent config stored in plaintext, including WiFi credentials (SSID + password stored as cleartext strings in flash).
-
-### Why the AES key is unreachable via static analysis
-
-The AES-GCM key for the manifest is managed by a **software Asset Store** (software HSM):
-
-```
-CLS_AssetAllocate          → allocates a protected memory slot
-CLS_AssetLoadValue         → loads key material into protected slot
-flpsul_create_gcm_giv_key  → initializes AES-GCM with generated IV
-```
-
-The key **never exists as plaintext on the flash**. It is derived at runtime using Canon's RSA certificates from the bootloader. Static analysis hits a hard wall here.
+WiFi credentials stored in cleartext. Firmware version string at offset +0x0845A5.
 
 ---
 
-## The Open Question — Help Needed
+## Phase 4 — OTA Firmware — SOLVED ✅
 
-### AES-GCM manifest structure
+### Download and decrypt
+
+```bash
+# Download official Canon OTA firmware
+wget -L "http://pdisp01.c-wss.com/gdl/WWUFORedirectTarget.do?id=MDQwMDAwNzg2MzAx" \
+  -O A18B7V1040AN.bin
+# → redirects to http://gdlp01.c-wss.com/gds/3/0400007863/01/A18B7V1040AN.bin
+# Size: 7,230,976 bytes
+
+# Decrypt (credit: Wintermute)
+openssl enc -d -aes-128-cbc \
+  -K fa935576d14688c358574f225348151e \
+  -iv 7954d086f70daf214d3bf290d350ce5c \
+  -in A18B7V1040AN.bin \
+  -out A18B7V1040AN.ijsb
+```
+
+### IJSB format structure
+
+The decrypted file uses Canon's proprietary **IJSB (IJ Software Bundle)** format:
 
 ```
-Total size  : 304 bytes
-= 19 × 16-byte AES blocks
+Magic    : IJSB
+Metadata : <metadata version="1.0.0"><model>A18B7</model><version>1.040</version></metadata>
 
-Possible structure A (nonce 12 bytes):
-  [nonce 12B][ciphertext 276B][tag 16B]
-
-Possible structure B (nonce 4 bytes, matching IV_prefixlen==4):
-  [nonce 4B][ciphertext 284B][tag 16B]
-
-Possible structure C (nonce 6 bytes, matching IV_prefixlen==6):
-  [nonce 6B][ciphertext 282B][tag 16B]
+Section 0: IJFIRM_BEGIN
+Section 1:  28 KB  — SROM:1:1 (bootloader stub)
+Section 2:   0 KB  — empty
+Section 3: 4557 KB — main firmware image (contains zlib blobs)
+Section 4: 2399 KB — backup firmware image
+Section 5:  75 KB  — supplemental data
+           IJFIRM_END
 ```
 
-### What I need help with
-
-1. **MatrixSSL Asset Store key derivation** — does anyone know how `flpsul_create_gcm_giv_key_and_state` derives its key from the Asset Store in MatrixSSL/BSAFE? The source is partially open — maybe the derivation scheme is documented or reversible.
-
-2. **UART debug pads** — the PCB has unpopulated pad groups. If anyone has done UART work on Canon PIXMA TS3400 series, I'd love to compare notes on baud rate and pinout.
-
-3. **Buffer overflow in NVRAM** — since NVRAM is unsigned, oversized WiFi credentials might trigger a stack overflow in the credential parsing code. Haven't tested yet (waiting for CH341A clip to arrive for safe reflashing).
+**Key generator locations** (credit: Wintermute):
+```
+Manifest key/IV gen : blob offsets 0xb88b4 and 0xb8702
+OTA firmware key/IV gen : blob offset 0xB884C and 0xB869A
+Decrypting code     : blob offset 0x3b592 (manifest), 0x4CD3C (OTA)
+```
 
 ---
 
@@ -321,13 +293,15 @@ Possible structure C (nonce 6 bytes, matching IV_prefixlen==6):
 | Category | Finding |
 |----------|---------|
 | Network | 3 Canon domains, 2 in plaintext HTTP |
-| Manifest | AES-GCM, identifier `a18b7`, full URL recovered |
+| Manifest | **AES-128-CBC, fully decrypted** ✅ |
+| OTA firmware | **Downloaded and decrypted** ✅ |
 | Trust store | 20 CAs extracted, 5 expired |
 | Flash | Winbond W25Q128 16MB, clean dump |
-| Firmware | 3 partitions + bootloader, 3 zlib blobs decompressed |
-| Crypto | MatrixSSL/BSAFE, AES-GCM, runtime Asset Store |
+| Firmware | 20 zlib blobs across 3 partitions |
+| Crypto | MatrixSSL/BSAFE, AES-128-CBC |
 | NVRAM | WiFi credentials in cleartext |
-| Version | V00.15.RC1.JAPAN-CANON |
+| IJSB format | 5-section bundle, documented |
+| Version | V00.15.RC1.JAPAN-CANON / 1.040 |
 
 ---
 
@@ -340,9 +314,15 @@ Possible structure C (nonce 6 bytes, matching IV_prefixlen==6):
 | `Raspberry Pi 5` | SPI programmer via GPIO |
 | `Python 3` + `pycryptodome` | Crypto analysis |
 | `Ghidra` | ARM reverse engineering |
-| `binwalk` | Firmware analysis |
+| `openssl` | Firmware decryption |
 | `dec_sdata` (leecher1337) | Trust store decryption |
 | `sane-airscan` | Driverless scan test |
+
+---
+
+## Credits
+
+- **Wintermute** — recovered AES-128-CBC keys for both manifest and OTA firmware. This research wouldn't be complete without his contribution.
 
 ---
 
@@ -352,6 +332,7 @@ Possible structure C (nonce 6 bytes, matching IV_prefixlen==6):
 - Synacktiv — "Treasure Chest Party Quest: From Doom to Exploit" (2020)
 - leecher1337/pixma — Canon PIXMA firmware tools (GitHub)
 - synacktiv/canon-tools — Canon firmware decryption tools (GitHub)
+- CHDK Wiki — DryOS PIXMA Printer Shell
 
 ---
 
